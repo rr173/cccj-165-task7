@@ -265,10 +265,27 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                 if auth.startswith("Bearer "):
                     raw = [t.strip() for t in auth[len("Bearer "):].split(",")
                            if t.strip()]
+                # Optional version pin: the request is served only while this
+                # exact publication is active. It is also part of the request
+                # fingerprint an Idempotency-Key is bound to.
+                expected_version = None
+                vcond = self.headers.get("X-Corpus-Version")
+                if vcond is not None:
+                    try:
+                        expected_version = int(vcond)
+                    except (TypeError, ValueError):
+                        return self._error(400, "invalid X-Corpus-Version")
                 try:
                     result = budget.consume(
                         conn, raw, prefix,
-                        idem_key=self.headers.get("Idempotency-Key"))
+                        idem_key=self.headers.get("Idempotency-Key"),
+                        expected_version=expected_version)
+                except budget.IdempotencyConflict:
+                    # Same key, different fingerprint (selector / credentials /
+                    # version condition). Fixed body, 409, nothing mutated.
+                    return self._error(409, budget.IDEMPOTENCY_CONFLICT)
+                except budget.VersionConditionMismatch:
+                    return self._error(409, budget.VERSION_MISMATCH)
                 except budget.BudgetAuth:
                     return self._error(401, "missing or invalid budget token")
                 except budget.NoActivePublication:
