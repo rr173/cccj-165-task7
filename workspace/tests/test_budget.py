@@ -213,6 +213,195 @@ class RepeatedRequestTests(BudgetBase):
         with self.assertRaises(budget.BudgetError):
             self.consume(t2, idem_key="shared")
 
+    def test_same_key_different_selector_conflicts_without_side_effects(self):
+        t = self.issue()["token"]
+        r1 = self.consume(t, "AA", idem_key="k")
+        first_body = r1["body"]
+        ev0 = self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events").fetchone()["c"]
+        # re-presenting the key for a DIFFERENT resource selector is a hard 409
+        with self.assertRaises(budget.IdempotencyConflict) as cm:
+            self.consume(t, "BB", idem_key="k")
+        # fixed message: never echoes the key, the selector or the tenant
+        self.assertEqual(str(cm.exception),
+                         "idempotency key was already used with a different"
+                         " request")
+        self.assertEqual(cm.exception.http_status, 409)
+        b = self.bucket()
+        self.assertEqual((b["remaining"], b["spent"]),
+                         (self.quota - 1, 1))  # still only the first charge
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events").fetchone()["c"], ev0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_idem").fetchone()["c"], 1)
+        # the conflict never returned the second resource: AA body untouched
+        self.assertNotEqual(first_body, "")
+
+    def test_conflict_creates_no_state_for_unknown_tenant_bucket(self):
+        # a second tenant that has never made a request must not gain a bucket
+        t1 = self.issue("a")["token"]
+        t2 = self.issue("zzz")["token"]
+        self.consume(t1, "AA", idem_key="k")
+        with self.assertRaises(budget.IdempotencyConflict):
+            self.consume(t2, "AA", idem_key="k")
+        self.assertIsNone(self.bucket("zzz"))
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events WHERE tenant_id='zzz'"
+        ).fetchone()["c"], 0)
+
+    def test_same_key_different_credential_conflicts_even_same_tenant(self):
+        t1 = self.issue("a", "one")["token"]
+        t2 = self.issue("a", "two")["token"]  # different token, SAME tenant
+        self.consume(t1, "AA", idem_key="k")
+        with self.assertRaises(budget.IdempotencyConflict):
+            self.consume(t2, "AA", idem_key="k")
+        # presenting an ADDITIONAL credential changes the credential set too
+        with self.assertRaises(budget.IdempotencyConflict):
+            budget.consume(self.conn, [t1, t2], "AA", idem_key="k")
+        # but repeating the same token (even duplicated/ordered) is a replay
+        r = budget.consume(self.conn, [t1, t1], "AA", idem_key="k")
+        self.assertEqual(r["status"], "replay")
+
+    def test_replay_returns_first_status_after_version_switch(self):
+        t = self.issue()["token"]
+        r1 = self.consume(t, "AA", idem_key="k")
+        self.assertEqual(r1["version"], self.version)
+        # publish a new active version (AA content changes there)
+        core.ingest_batch(self.conn, "s2",
+                         pw_with_prefix("AA", 3, start=1000, tag="b"))
+        v2 = core.build_candidate(self.conn, k=1)["version"]
+        core.activate(self.conn, v2)
+        live = self.consume(t, "AA")  # a fresh request sees the new version
+        self.assertEqual(live["version"], v2)
+        # the keyed replay is pinned to the FIRST version and its body
+        rr = self.consume(t, "AA", idem_key="k")
+        self.assertEqual(rr["status"], "replay")
+        self.assertEqual(rr["version"], self.version)
+        self.assertEqual(rr["body"], r1["body"])
+        self.assertEqual(rr["http_result"], 200)
+        self.assertEqual(self.bucket()["spent"], 2)  # replay spent nothing
+
+    def test_replay_of_first_404_stays_404_after_bucket_appears(self):
+        t = self.issue()["token"]
+        r1 = self.consume(t, "BB", idem_key="miss")  # absent bucket: 404
+        self.assertEqual((r1["http_result"], r1["version"]),
+                         (404, self.version))
+        core.ingest_batch(self.conn, "s2",
+                         pw_with_prefix("BB", 3, tag="new"))
+        core.activate(self.conn, core.build_candidate(self.conn, k=1)["version"])
+        rr = self.consume(t, "BB", idem_key="miss")
+        self.assertEqual((rr["status"], rr["http_result"]), ("replay", 404))
+        self.assertEqual(rr["body"], "")
+        self.assertEqual(rr["version"], self.version)  # pinned, not the new v
+        self.assertEqual(self.bucket()["spent"], 1)    # both read once total
+
+    def test_replay_of_first_exhaustion_stays_429_after_topup(self):
+        t = self.issue()["token"]
+        for _ in range(self.quota):
+            self.consume(t, "AA")
+        den = self.consume(t, "AA", idem_key="ex")
+        self.assertEqual((den["http_result"], den["reason"]),
+                         (429, "budget_exhausted"))
+        exhausted_events = self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events"
+            " WHERE result='budget_exhausted'").fetchone()["c"]
+        budget.topup(self.conn, "t1", 10)
+        rr = self.consume(t, "AA", idem_key="ex")
+        self.assertEqual((rr["status"], rr["http_result"], rr["reason"]),
+                         ("replay", 429, "budget_exhausted"))
+        # no extra exhaustion event appended by the replay
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events"
+            " WHERE result='budget_exhausted'").fetchone()["c"],
+                         exhausted_events)
+
+    def test_replay_of_first_frozen_stays_403_after_unfreeze(self):
+        t = self.issue()["token"]
+        budget.freeze_tenant(self.conn, "t1")
+        den = self.consume(t, "AA", idem_key="fz")
+        self.assertEqual(den["http_result"], 403)
+        budget.unfreeze_tenant(self.conn, "t1")
+        rr = self.consume(t, "AA", idem_key="fz")
+        self.assertEqual((rr["status"], rr["http_result"], rr["reason"]),
+                         ("replay", 403, "frozen"))
+        self.assertEqual(self.bucket()["spent"], 0)
+
+    def test_replay_of_first_revoked_stays_403_without_second_event(self):
+        info = self.issue()
+        budget.revoke_token(self.conn, info["token_id"])
+        den = self.consume(info["token"], "AA", idem_key="rv")
+        self.assertEqual((den["http_result"], den["reason"]),
+                         (403, "token_revoked"))
+        events0 = self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events"
+            " WHERE result='token_revoked'").fetchone()["c"]
+        rr = self.consume(info["token"], "AA", idem_key="rv")
+        self.assertEqual((rr["status"], rr["http_result"], rr["reason"]),
+                         ("replay", 403, "token_revoked"))
+        # the replay appends no second revocation event and serves no body
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM budget_events"
+            " WHERE result='token_revoked'").fetchone()["c"], events0)
+        self.assertEqual(rr["body"], "")
+
+    def test_replay_survives_process_restart(self):
+        t = self.issue()["token"]
+        r1 = self.consume(t, "AA", idem_key="persist")
+        self.conn.close()
+        c2 = db.connect(self.db_path)
+        try:
+            rr = budget.consume(c2, [t], "AA", idem_key="persist",
+                                prefix_len=2)
+            self.assertEqual(rr["status"], "replay")
+            self.assertEqual(rr["body"], r1["body"])
+            self.assertEqual(rr["version"], r1["version"])
+        finally:
+            c2.close()
+        self.conn = db.connect(self.db_path)
+
+    def test_parallel_same_key_different_selectors_one_winner_rest_conflict(self):
+        t = self.issue()["token"]
+        outcomes = []
+        lock = threading.Lock()
+
+        def work(i):
+            c = db.connect(self.db_path)
+            try:
+                pref = "AA" if i % 2 == 0 else "BB"
+                try:
+                    r = budget.consume(c, [t], pref, idem_key="race")
+                    with lock:
+                        outcomes.append(
+                            ("ok", r["status"], r["http_result"], pref,
+                             r["body"]))
+                except budget.IdempotencyConflict:
+                    with lock:
+                        outcomes.append(("conflict", pref))
+            finally:
+                c.close()
+
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            list(ex.map(work, range(12)))
+        oks = [o for o in outcomes if o[0] == "ok"]
+        conflicts = [o for o in outcomes if o[0] == "conflict"]
+        # exactly one FIRST response; same-fingerprint losers replay it;
+        # different-selector requests are all rejected with 409
+        self.assertEqual(sum(1 for o in oks if o[1] == "allowed"), 1)
+        winner_pref = next(o[3] for o in oks if o[1] == "allowed")
+        winner_body = next(o[4] for o in oks if o[1] == "allowed")
+        self.assertTrue(all(o[3] == winner_pref for o in oks))
+        self.assertTrue(all(o[4] == winner_body for o in oks))
+        # every request that asked for the OTHER selector got a conflict
+        self.assertTrue(all(o[1] != winner_pref for o in conflicts))
+        self.assertEqual(len(conflicts),
+                         sum(1 for i in range(12)
+                             if ("AA" if i % 2 == 0 else "BB") != winner_pref))
+        # one charge in total; the losing selector body was never served
+        self.assertEqual(self.bucket()["spent"], 1)
+        loser = "BB" if winner_pref == "AA" else "AA"
+        self.assertNotIn(loser, json.dumps(
+            [o for o in oks if o[1] != "allowed"]))
+
     def test_replay_after_exhaustion_returns_stored_outcome(self):
         t = self.issue()["token"]
         for _ in range(self.quota - 1):
@@ -225,6 +414,43 @@ class RepeatedRequestTests(BudgetBase):
         self.assertEqual(r["status"], "replay")
         self.assertEqual(r["http_result"], 200)
         self.assertEqual(self.bucket()["spent"], self.quota)
+
+    def test_legacy_idem_row_without_fingerprint_fails_closed(self):
+        # A budget_idem row written by an older release has no fingerprint
+        # columns; after the additive migration a replay against it must be a
+        # 409, never an unvalidated reuse. Uses a real old-format DB.
+        tmp2 = tempfile.mkdtemp(prefix="pwncorpus-legacy-idem-")
+        self.addCleanup(shutil.rmtree, tmp2, True)
+        p2 = os.path.join(tmp2, "c.db")
+        k2 = os.path.join(tmp2, "b.key")
+        db.init(p2)
+        old = db.connect(p2)
+        old.executescript(budget.BUDGET_SCHEMA)  # full CURRENT schema first
+        # then replace budget_idem with the shape an older release wrote
+        old.execute("DROP TABLE budget_idem")
+        old.execute(
+            "CREATE TABLE budget_idem (idem_key TEXT PRIMARY KEY,"
+            " tenant_id TEXT NOT NULL, window_start INTEGER NOT NULL,"
+            " result TEXT NOT NULL, version INTEGER, created_at TEXT NOT NULL)")
+        old.close()
+        c2 = db.connect(p2)
+        budget.initialise(c2, k2, daily_quota=self.quota)  # runs migration
+        cols = {r["name"] for r in c2.execute(
+            "PRAGMA table_info(budget_idem)")}
+        self.assertIn("prefix_sha256", cols)
+        tok = budget.issue_token(c2, "t1", "l")["token"]
+        ws = budget.current_window_start()
+        c2.execute(
+            "INSERT INTO budget_idem(idem_key, tenant_id, window_start,"
+            " result, version, created_at) VALUES ('old','t1',?,'served',1,'t')",
+            (ws,))
+        c2.commit()
+        with self.assertRaises(budget.IdempotencyConflict):
+            budget.consume(c2, [tok], "AA", idem_key="old")
+        self.assertIsNone(budget.get_bucket(c2, "t1", ws))
+        self.assertEqual(c2.execute(
+            "SELECT COUNT(*) c FROM budget_events").fetchone()["c"], 0)
+        c2.close()
 
 
 # --------------------------------------------------------------------------
@@ -996,6 +1222,35 @@ class HttpTests(BudgetBase):
                                 token=self.admin)
         self.assertEqual(st, 200)
         self.assertEqual(body["windows"][0]["spent"], 1)
+
+    def test_idempotency_fingerprint_conflict_is_fixed_409_over_http(self):
+        tok, _ = self.btoken("fp")
+        h = {"Idempotency-Key": "same-key"}
+        st1, body1, h1 = self.http("GET", "/api/range/AA", token=tok,
+                                   extra_headers=h, raw=True)
+        self.assertEqual(st1, 200)
+        first = body1
+        # same key, different selector -> constant 409 body
+        st2, body2, h2 = self.http("GET", "/api/range/BB", token=tok,
+                                   extra_headers=h)
+        self.assertEqual(st2, 409)
+        self.assertEqual(body2,
+                         {"error": "idempotency key was already used with a"
+                                   " different request"})
+        # the denial carries no tenant/budget/corpus state and no second body
+        self.assertNotIn("X-Budget-Tenant", h2)
+        self.assertNotIn("X-Corpus-Version", h2)
+        self.assertNotIn("fp", json.dumps(body2))
+        # identical request still replays the exact first body/status
+        st3, body3, _ = self.http("GET", "/api/range/AA", token=tok,
+                                  extra_headers=h, raw=True)
+        self.assertEqual(st3, 200)
+        self.assertEqual(body3, first)
+        st, status, _ = self.http("GET",
+                                  "/api/budget/tenants/fp/status",
+                                  token=self.admin)
+        self.assertEqual(status["windows"][0]["spent"], 1)
+        self.assertEqual(status["windows"][0]["deductions"], 1)
 
 
 def _maybe_json(payload):

@@ -18,7 +18,12 @@ The budget table itself has exactly the six mandated fields:
 Everything else lives in separate tables: policy revisions (immutable; a new
 revision only affects windows created afterwards), per-query tokens (only their
 SHA-256 is stored), an append-only event stream (the audit source of truth),
-top-up grants, an admin log, and idempotency records.
+top-up grants, an admin log, and idempotency records. Idempotency records bind
+a key to the full request fingerprint (prefix hash, credential-set hash, and
+the publication version first served): a key re-presented with a different
+fingerprint is a fixed 409 with no side effect, while an identical replay
+reconstructs the first outcome -- from the stored, immutable version -- and
+neither charges again nor appends an event.
 
 Isolation / ordering rules:
 
@@ -154,17 +159,52 @@ CREATE TABLE IF NOT EXISTS budget_admin_log (
   created_at  TEXT NOT NULL
 );
 
--- Idempotent replays: a repeated key returns the original outcome and never
--- spends a second unit.
+-- Idempotent replays. A key is bound to the FULL request fingerprint:
+--   * the resource selector (the queried prefix, stored only as a hash),
+--   * the exact set of credentials presented (their token hashes, again hashed),
+--   * the active publication version the FIRST response was served from.
+-- Re-presenting the key with a different prefix/credential set/version is a
+-- hard 409 conflict: the stored response is never reused, no second resource
+-- body is returned, and nothing is charged or appended. A genuine replay
+-- reconstructs the FIRST outcome (including from a since-retired version),
+-- spending no second unit and appending no event.
 CREATE TABLE IF NOT EXISTS budget_idem (
-  idem_key      TEXT PRIMARY KEY,
-  tenant_id     TEXT NOT NULL,
-  window_start  INTEGER NOT NULL,
-  result        TEXT NOT NULL,
-  version       INTEGER,
-  created_at    TEXT NOT NULL
+  idem_key        TEXT PRIMARY KEY,
+  tenant_id       TEXT NOT NULL,
+  window_start    INTEGER NOT NULL,
+  result          TEXT NOT NULL,
+  http_result     INTEGER NOT NULL,
+  version         INTEGER,
+  prefix_sha256   TEXT NOT NULL,
+  cred_sha256     TEXT NOT NULL,
+  remaining_after INTEGER NOT NULL,
+  spent_after     INTEGER NOT NULL,
+  policy_revision INTEGER NOT NULL,
+  created_at      TEXT NOT NULL
 );
 """
+
+
+def _migrate_budget_schema(conn) -> None:
+    """Additive upgrades for budget_idem rows written by older versions.
+
+    New columns land nullable on old rows; a legacy row lacks the request
+    fingerprint, so a replay against it fails CLOSED (409 conflict) instead of
+    ever serving material the fingerprint cannot prove was first requested."""
+    cols = {r["name"] for r in conn.execute(
+        "PRAGMA table_info(budget_idem)")}
+    if not cols:
+        return
+    for name, decl in (
+        ("http_result", "INTEGER"),
+        ("prefix_sha256", "TEXT"),
+        ("cred_sha256", "TEXT"),
+        ("remaining_after", "INTEGER"),
+        ("spent_after", "INTEGER"),
+        ("policy_revision", "INTEGER"),
+    ):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE budget_idem ADD COLUMN {name} {decl}")
 
 
 class BudgetError(Exception):
@@ -173,6 +213,18 @@ class BudgetError(Exception):
 
 class BudgetAuth(BudgetError):
     """No usable presented token (unknown token / none presented)."""
+
+
+class IdempotencyConflict(BudgetError):
+    """An idempotency key was re-presented with a different request fingerprint
+    (different resource selector / credential set / version condition). The
+    fixed message deliberately discloses nothing about which part differed."""
+    http_status = 409
+
+
+# The single, fixed body every fingerprint-mismatch rejection carries. It is
+# constant across callers, selectors and versions (no prefix/tenant echoed).
+CONFLICT_MESSAGE = "idempotency key was already used with a different request"
 
 
 class NoActivePublication(BudgetError):
@@ -304,6 +356,7 @@ def initialise(conn, key_path: str, daily_quota: int = DEFAULT_DAILY_QUOTA) -> d
             or daily_quota < 0:
         raise BudgetError("daily quota must be a non-negative integer")
     conn.executescript(BUDGET_SCHEMA)
+    _migrate_budget_schema(conn)
     if conn.execute("SELECT 1 FROM budget_meta WHERE key=?",
                     (META_BUDGET_ID,)).fetchone() is not None:
         raise BudgetError("budget module is already initialised")
@@ -462,9 +515,11 @@ def revoke_token(conn, token_id: str) -> dict:
 
 
 def _resolve_tokens(conn, raw_tokens: list[str]):
-    """Return (tenants, revoked_tenant) for the presented tokens.
+    """Return (tenants, revoked_tenant, token_hashes) for the presented tokens.
 
     tenants: ordered distinct tenant ids backing valid, non-revoked tokens.
+    token_hashes: the stored SHA-256 of every presented (recognised) token,
+    deduplicated and sorted -- order-insensitive identity fingerprint input.
     An unrecognised token is an authentication failure (no tenant exists).
     A recognised-but-revoked token yields its tenant as a revocation failure.
     """
@@ -475,8 +530,7 @@ def _resolve_tokens(conn, raw_tokens: list[str]):
             cleaned.append(t)
     if not cleaned:
         raise BudgetAuth("missing budget token")
-    tenants, revoked = [], []
-    seen = set()
+    tenants, revoked, hashes = [], [], set()
     for token in cleaned:
         h = hashlib.sha256(token.encode()).hexdigest()
         row = conn.execute(
@@ -484,15 +538,30 @@ def _resolve_tokens(conn, raw_tokens: list[str]):
             " WHERE token_sha256=?", (h,)).fetchone()
         if row is None:
             raise BudgetAuth("invalid budget token")
+        hashes.add(h)
         if row["revoked"]:
             revoked.append(row["tenant_id"])
-        elif row["tenant_id"] not in seen:
-            seen.add(row["tenant_id"])
+        elif row["tenant_id"] not in set(tenants):
             tenants.append(row["tenant_id"])
+    tenants.sort()
     if revoked:
         # deterministic first revoked tenant (one failure event per request)
-        return sorted(tenants), sorted(revoked)[0]
-    return sorted(tenants), None
+        return tenants, sorted(revoked)[0], sorted(hashes)
+    return tenants, None, sorted(hashes)
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _request_fingerprints(prefix: str, token_hashes: list[str]):
+    """The two identity/selector parts of the request fingerprint.
+
+    The prefix never lands in the budget store in clear text; only its hash
+    does. The credential fingerprint hashes the exact SET of presented token
+    hashes, so token order and duplicates are irrelevant but presenting a
+    different token always changes it."""
+    return (_sha256_text(prefix), _sha256_text("\n".join(token_hashes)))
 
 
 # --------------------------------------------------------------------------
@@ -655,7 +724,16 @@ def consume(conn, raw_tokens: list[str], prefix: str, *,
     Returns a result dict:
       {status: 'allowed'|'denied'|'replay', reason?, tenant_id, window_start,
        remaining_before, remaining_after, spent, policy_revision, version,
-       body ('' allowed/404 -> ''), http_result}
+       body ('' allowed/404 -> ''), http_result, stored_result?}
+
+    Idempotency keys are bound to the request fingerprint (resource selector,
+    the exact presented credential set, and the active version at first-serve
+    time). Re-presenting a key with an identical fingerprint replays the FIRST
+    outcome with no second deduction and no new event, even across restart,
+    exhaustion/freeze state changes or a newer publication being activated.
+    Presenting it with a DIFFERENT fingerprint raises IdempotencyConflict (HTTP
+    409, fixed body) and changes nothing: no counter, no event, no stored
+    snapshot mutation, and no body from the second selector.
 
     Denial reasons: budget_exhausted, frozen, token_revoked. Unknown tokens
     raise BudgetAuth. No active publication raises NoActivePublication (nothing
@@ -665,11 +743,20 @@ def consume(conn, raw_tokens: list[str], prefix: str, *,
     after the deduction and the event row are written but before COMMIT, letting
     a test force a crash that must roll the deduction fully back."""
     _require_init(conn)
+    _migrate_budget_schema(conn)
     if prefix_len is None:
         prefix_len = core.PREFIX_LEN  # read at call time, like every other module
     now = now or utcnow()
     ws = window_start_for(now)
     now_s = now.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    # Precompute this request's fingerprint OUTSIDE the write transaction so
+    # that after losing a parallel insert race the winner's stored record can
+    # be classified (replay vs 409) without a blind reuse.
+    fp_prefix = fp_cred = None
+    if idem_key is not None:
+        fp_prefix, fp_cred = _fingerprint_for(conn, raw_tokens, prefix,
+                                              prefix_len)
 
     for attempt in range(30):
         try:
@@ -681,25 +768,62 @@ def consume(conn, raw_tokens: list[str], prefix: str, *,
             time.sleep(0.005 * (attempt + 1))
             continue
         except sqlite3.IntegrityError as exc:
-            # Lost an idempotency-key insert race: the winner's record is now
-            # visible; re-run and return its stored outcome.
-            if idem_key is not None and _idem_exists(conn, idem_key):
-                continue
+            # Lost an idempotency-key insert race: the winner committed first.
+            # Same fingerprint -> replay the winner; a different selector /
+            # credential set -> the fixed 409, never the second body.
+            if idem_key is not None:
+                winner = conn.execute(
+                    "SELECT * FROM budget_idem WHERE idem_key=?",
+                    (idem_key,)).fetchone()
+                if winner is not None:
+                    tenants, revoked_tenant = _auth_for(conn, raw_tokens)
+                    if _fingerprint_matches(
+                            winner, tenants, revoked_tenant,
+                            fp_prefix, fp_cred):
+                        continue
+                    raise IdempotencyConflict(CONFLICT_MESSAGE)
             raise BudgetError(f"budget write conflict ({exc})") from exc
     raise BudgetError("budget consume kept losing a parallel race")  # pragma: no cover
 
 
-def _idem_exists(conn, key: str) -> bool:
-    return conn.execute("SELECT 1 FROM budget_idem WHERE idem_key=?",
-                        (key,)).fetchone() is not None
+def _fingerprint_for(conn, raw_tokens, prefix, prefix_len):
+    """Authenticate/validate read-only and return (prefix_fp, cred_fp). Used
+    ahead of the write transaction to classify a lost insert race."""
+    _tenants, _revoked, token_hashes = _resolve_tokens(conn, raw_tokens)
+    prefix = _validate_prefix(prefix, prefix_len)
+    return _request_fingerprints(prefix, token_hashes)
+
+
+def _auth_for(conn, raw_tokens):
+    tenants, revoked_tenant, _hashes = _resolve_tokens(conn, raw_tokens)
+    return tenants, revoked_tenant
 
 
 def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
                     crash_after_deduct=None):
     # Authentication precedes prefix semantics: an invalid token must not learn
     # whether a prefix is well-formed; _resolve_tokens raises on unknown tokens.
-    tenants, revoked_tenant = _resolve_tokens(conn, raw_tokens)
+    tenants, revoked_tenant, token_hashes = _resolve_tokens(conn, raw_tokens)
     prefix = _validate_prefix(prefix, prefix_len)
+    fp_prefix, fp_cred = _request_fingerprints(prefix, token_hashes)
+
+    # An existing key is checked against the FULL fingerprint BEFORE anything
+    # else happens. A mismatch is a hard, side-effect-free conflict: no bucket
+    # creation, no deduction, no event and no body of the second resource.
+    prior = None
+    if idem_key:
+        prior = conn.execute(
+            "SELECT * FROM budget_idem WHERE idem_key=?", (idem_key,)).fetchone()
+        if prior is not None and not _fingerprint_matches(
+                prior, tenants, revoked_tenant, fp_prefix, fp_cred):
+            raise IdempotencyConflict(CONFLICT_MESSAGE)
+
+    # Genuine replay: reconstruct the FIRST stored outcome. No deduction, no
+    # event and no bucket mutation -- the snapshot the counters/events had when
+    # the first response committed is exactly what is returned. This precedes
+    # the revocation branch so a first answer of "revoked" is replayed too.
+    if prior is not None:
+        return _replay(conn, prior, prefix)
 
     if revoked_tenant is not None:
         b = _ensure_bucket_locked(conn, revoked_tenant, ws)
@@ -707,33 +831,14 @@ def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
             "INSERT INTO budget_events(tenant_id, window_start, result,"
             " created_at) VALUES (?,?,?,?)",
             (revoked_tenant, ws, REASON_TOKEN_REVOKED, now_s))
+        if idem_key:
+            # No active-version read happens for a revoked request; its version
+            # condition is therefore recorded as NULL.
+            _store_idem(conn, idem_key, revoked_tenant, ws,
+                        REASON_TOKEN_REVOKED, 403, None,
+                        fp_prefix, fp_cred, b, now_s)
         return _denied(REASON_TOKEN_REVOKED, revoked_tenant, ws, b,
                        http_result=403)
-
-    # Idempotent replay: return the original outcome, spend nothing.
-    if idem_key:
-        prior = conn.execute(
-            "SELECT * FROM budget_idem WHERE idem_key=?", (idem_key,)).fetchone()
-        if prior is not None:
-            if prior["tenant_id"] not in tenants:
-                raise BudgetError("idempotency key is bound to another tenant")
-            b = _ensure_bucket_locked(conn, prior["tenant_id"],
-                                      prior["window_start"])
-            version, body = _read_corpus(conn, prefix, required=False)
-            return {
-                "status": "replay", "reason": None,
-                "tenant_id": prior["tenant_id"],
-                "window_start": prior["window_start"],
-                "remaining_before": b["remaining"],
-                "remaining_after": b["remaining"], "spent": b["spent"],
-                "policy_revision": b["policy_revision"],
-                "version": version,
-                "body": body if prior["result"] == RESULT_SERVED else "",
-                "http_result": 200 if prior["result"] == RESULT_SERVED
-                else (404 if prior["result"] == RESULT_NOT_FOUND else 429
-                      if prior["result"] == REASON_EXHAUSTED else 403),
-                "stored_result": prior["result"],
-            }
 
     buckets = [_ensure_bucket_locked(conn, tid, ws) for tid in tenants]
     candidates = [
@@ -745,7 +850,8 @@ def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
     gov = _governing(candidates)
     gtid = gov["tenant_id"]
 
-    # A 503 costs nothing and is decided before any deduction.
+    # A 503 costs nothing and is decided before any deduction (and is not made
+    # idempotent: nothing was served and no version condition existed yet).
     version, body = _read_corpus(conn, prefix, required=False)
     if version is None:
         raise NoActivePublication("no active publication")
@@ -755,15 +861,21 @@ def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
             "INSERT INTO budget_events(tenant_id, window_start, result,"
             " created_at) VALUES (?,?,?,?)",
             (gtid, ws, REASON_FROZEN, now_s))
-        return _denied(REASON_FROZEN, gtid, ws,
-                      _bucket_row(conn, gtid, ws), http_result=403)
+        fresh = _bucket_row(conn, gtid, ws)
+        if idem_key:
+            _store_idem(conn, idem_key, gtid, ws, REASON_FROZEN, 403, version,
+                        fp_prefix, fp_cred, fresh, now_s)
+        return _denied(REASON_FROZEN, gtid, ws, fresh, http_result=403)
     if gov["remaining"] <= 0:
         conn.execute(
             "INSERT INTO budget_events(tenant_id, window_start, result,"
             " created_at) VALUES (?,?,?,?)",
             (gtid, ws, REASON_EXHAUSTED, now_s))
-        return _denied(REASON_EXHAUSTED, gtid, ws,
-                      _bucket_row(conn, gtid, ws), http_result=429)
+        fresh = _bucket_row(conn, gtid, ws)
+        if idem_key:
+            _store_idem(conn, idem_key, gtid, ws, REASON_EXHAUSTED, 429, version,
+                        fp_prefix, fp_cred, fresh, now_s)
+        return _denied(REASON_EXHAUSTED, gtid, ws, fresh, http_result=429)
 
     before = gov["remaining"]
     cur = conn.execute(
@@ -780,6 +892,10 @@ def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
             "INSERT INTO budget_events(tenant_id, window_start, result,"
             " created_at) VALUES (?,?,?,?)",
             (gtid, ws, reason, now_s))
+        if idem_key:
+            _store_idem(conn, idem_key, gtid, ws, reason,
+                        403 if fresh["frozen"] else 429, version,
+                        fp_prefix, fp_cred, fresh, now_s)
         return _denied(reason, gtid, ws, fresh,
                        http_result=403 if fresh["frozen"] else 429)
 
@@ -790,15 +906,14 @@ def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
         (gtid, ws, result, now_s))
     if crash_after_deduct is not None:
         crash_after_deduct(conn)  # test seam: force rollback post-deduction
+    after = _bucket_row(conn, gtid, ws)
     if idem_key:
         try:
-            conn.execute(
-                "INSERT INTO budget_idem(idem_key, tenant_id, window_start,"
-                " result, version, created_at) VALUES (?,?,?,?,?,?)",
-                (idem_key, gtid, ws, result, version, now_s))
+            _store_idem(conn, idem_key, gtid, ws, result,
+                        200 if body is not None else 404, version,
+                        fp_prefix, fp_cred, after, now_s)
         except sqlite3.IntegrityError:
             raise _Retry()
-    after = _bucket_row(conn, gtid, ws)
     return {"status": "allowed", "reason": None, "tenant_id": gtid,
             "window_start": ws, "remaining_before": before,
             "remaining_after": after["remaining"], "spent": after["spent"],
@@ -806,6 +921,82 @@ def _consume_locked(conn, raw_tokens, prefix, prefix_len, ws, now_s, idem_key,
             "version": version, "body": body if body is not None else "",
             "http_result": 200 if body is not None else 404,
             "stored_result": result}
+
+
+def _fingerprint_matches(prior, tenants, revoked_tenant, fp_prefix: str,
+                         fp_cred: str) -> bool:
+    """Every bound part of the request must be identical. A legacy row (no
+    stored fingerprints) can never match: fail closed. The credential-set hash
+    is the primary identity check; the stored tenant must additionally still be
+    among the callers' tenants (or be the tenant whose token is presented
+    revoked), which is what binds a key across tenants."""
+    if prior["prefix_sha256"] is None or prior["cred_sha256"] is None:
+        return False
+    if prior["cred_sha256"] != fp_cred or prior["prefix_sha256"] != fp_prefix:
+        return False
+    bound = prior["tenant_id"]
+    if bound not in tenants and bound != revoked_tenant:
+        return False
+    return True
+
+
+def _store_idem(conn, idem_key, tenant_id, ws, result, http_result, version,
+                fp_prefix, fp_cred, bucket_row, now_s) -> None:
+    conn.execute(
+        "INSERT INTO budget_idem(idem_key, tenant_id, window_start, result,"
+        " http_result, version, prefix_sha256, cred_sha256, remaining_after,"
+        " spent_after, policy_revision, created_at)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (idem_key, tenant_id, ws, result, http_result, version,
+         fp_prefix, fp_cred, bucket_row["remaining"], bucket_row["spent"],
+         bucket_row["policy_revision"], now_s))
+
+
+def _replay(conn, prior, prefix: str) -> dict:
+    """Rebuild the FIRST response from its stored record.
+
+    The body is read from the STORED version (publications are immutable and
+    retired buckets are retained forever), so activating a newer release never
+    changes what a replayed key returns. Counters/events are untouched."""
+    result = prior["result"]
+    stored_http = prior["http_result"]
+    body = ""
+    version = prior["version"]
+    reason = None
+    if result == RESULT_SERVED:
+        # The body comes from the version the first response was served from,
+        # never the current active pointer.
+        body = _read_version_body(conn, prior["version"], prefix)
+    elif result in FAILURE_REASONS:
+        reason = result
+    return {
+        "status": "replay", "reason": reason,
+        "tenant_id": prior["tenant_id"],
+        "window_start": prior["window_start"],
+        "remaining_before": prior["remaining_after"],
+        "remaining_after": prior["remaining_after"],
+        "spent": prior["spent_after"],
+        "policy_revision": prior["policy_revision"],
+        "version": version,
+        "body": body,
+        "http_result": stored_http,
+        "stored_result": result,
+    }
+
+
+def _read_version_body(conn, version, prefix: str) -> str:
+    """Read one prefix bucket from an ARBITRARY (e.g. now-retired) publication.
+
+    Publications and their bucket rows are immutable and retained forever, so
+    this is a deterministic reconstruction of an earlier served body. Returns
+    "" if the bucket is absent in that version (a served record must not be)."""
+    if version is None:
+        return ""
+    rows = conn.execute(
+        "SELECT suffix, cnt FROM pub_buckets WHERE version = ? AND prefix = ?"
+        " ORDER BY suffix",
+        (version, prefix)).fetchall()
+    return "".join(f"{r['suffix']}:{r['cnt']}\n" for r in rows)
 
 
 def _bucket_row(conn, tenant_id: str, ws: int):

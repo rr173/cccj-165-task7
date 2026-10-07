@@ -273,20 +273,30 @@ def make_server(db_path: str, host: str, port: int) -> ThreadingHTTPServer:
                     return self._error(401, "missing or invalid budget token")
                 except budget.NoActivePublication:
                     return self._error(503, "no active publication")
+                except budget.IdempotencyConflict:
+                    # Fixed body for a fingerprint mismatch: never echo the key,
+                    # selector, tenant or which component differed.
+                    return self._json(409,
+                                      {"error": budget.CONFLICT_MESSAGE})
                 bhdr = {
                     "X-Budget-Tenant": result["tenant_id"],
                     "X-Budget-Remaining": str(result["remaining_after"]),
                     "X-Budget-Policy-Revision": str(result["policy_revision"]),
                     "X-Corpus-Version": str(result["version"]),
                 }
-                if result["status"] == "denied":
-                    # Identifiable only by the caller's own state; the body
-                    # never states whether the prefix bucket exists.
+                stored_result = result.get("stored_result")
+                if result["status"] == "denied" or (
+                        result["status"] == "replay"
+                        and stored_result in budget.FAILURE_REASONS):
+                    # A freshly computed denial, or a REPLAY of the first
+                    # denial (frozen/exhausted): identifiable only by the
+                    # caller's own state, never stating whether a bucket exists.
+                    reason = result["reason"]
                     if result["http_result"] == 429:
                         bhdr["Retry-After"] = str(budget.seconds_until_next_window(
                             result["window_start"]))
                     return self._json(result["http_result"],
-                                      {"error": result["reason"]}, headers=bhdr)
+                                      {"error": reason}, headers=bhdr)
                 if result["http_result"] == 404:
                     return self._json(404, {"error": "prefix not found"},
                                       headers=bhdr)
